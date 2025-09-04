@@ -69,11 +69,127 @@ class DefaultPlayer(BasePlayer):
             else:
                 return None
 
+class BestPlayer(BasePlayer):
+    """
+    Estratégia avançada do jogador que considera:
+    1. Urgência das metas (prioridade vs idade)
+    2. Eficiência do caminho total (pacote + entrega)
+    3. Penalidades por atrasos
+    4. Valor estratégico de cada entrega
+    """
+
+    def calculate_delivery_value(self, package_pos, goal, current_steps, player_pos):
+        """
+        Calcula o valor estratégico de uma entrega específica (pacote + meta)
+        Retorna: (score, total_distance, remaining_steps)
+        """
+        # Calcula distâncias
+        dist_to_package = abs(package_pos[0] - player_pos[0]) + abs(package_pos[1] - player_pos[1])
+        dist_package_to_goal = abs(goal["pos"][0] - package_pos[0]) + abs(goal["pos"][1] - package_pos[1])
+        total_distance = dist_to_package + dist_package_to_goal
+        
+        # Calcula urgência
+        prioridade = goal["priority"]
+        idade = current_steps - goal["created_at"]
+        remaining_steps = prioridade - idade
+        
+        # Calcula score baseado em múltiplos fatores
+        if remaining_steps >= total_distance:
+            # Entrega possível dentro do prazo - valor baseado na eficiência
+            time_ratio = remaining_steps / (total_distance + 1)
+            score = total_distance * (1 - min(time_ratio, 2) / 3)  # Bonificação por tempo extra
+        else:
+            # Entrega atrasada ou muito apertada - penalidade severa
+            delay = total_distance - remaining_steps
+            score = total_distance + delay * 15  # Penalidade alta por atraso
+        
+        # Ajusta score baseado na prioridade absoluta (entregas de alta prioridade valem mais)
+        score_adjustment = (110 - prioridade) / 50  # Prioridades mais altas (menores números) valem mais
+        score -= score_adjustment
+        
+        return score, total_distance, remaining_steps
+
+    def escolher_alvo(self, world, current_steps):
+        sx, sy = self.position
+        
+        # Se não está carregando pacotes, escolhe o melhor pacote com base nas metas disponíveis
+        if self.cargo == 0 and world.packages and world.goals:
+            best_score = float('inf')
+            best_choice = None
+            best_goal = None
+            
+            # Para cada pacote disponível
+            for pkg in world.packages:
+                # Para cada meta ativa
+                for goal in world.goals:
+                    score, total_dist, remaining = self.calculate_delivery_value(
+                        pkg, goal, current_steps, (sx, sy)
+                    )
+                    
+                    # Debug info
+                    # print(f"Pacote {pkg} + Meta {goal['pos']}: score={score:.2f}, dist={total_dist}, remaining={remaining}")
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_choice = pkg
+                        best_goal = goal
+            
+            # Se encontrou uma combinação boa
+            if best_choice:
+                # print(f"ESCOLHIDO: Pacote {best_choice} para Meta {best_goal['pos']} (score: {best_score:.2f})")
+                return best_choice
+        
+        # Se está carregando pacotes ou não há pacotes mas há metas
+        elif self.cargo > 0 and world.goals:
+            best_score = float('inf')
+            best_goal_pos = None
+            
+            # Escolhe a meta mais urgente/valiosa para entregar
+            for goal in world.goals:
+                # Calcula apenas a parte de entrega (já temos o pacote)
+                dist_to_goal = abs(goal["pos"][0] - sx) + abs(goal["pos"][1] - sy)
+                prioridade = goal["priority"]
+                idade = current_steps - goal["created_at"]
+                remaining_steps = prioridade - idade
+                
+                if remaining_steps >= dist_to_goal:
+                    score = dist_to_goal * 0.8  # Bonificação por estar já carregado
+                else:
+                    delay = dist_to_goal - remaining_steps
+                    score = dist_to_goal + delay * 10
+                
+                # Ajusta por prioridade
+                score -= (110 - prioridade) / 40
+                
+                if score < best_score:
+                    best_score = score
+                    best_goal_pos = goal["pos"]
+            
+            return best_goal_pos
+        
+        # Fallback: se não há metas mas há pacotes, pega o pacote mais próximo
+        elif self.cargo == 0 and world.packages:
+            best_dist = float('inf')
+            best_pkg = None
+            for pkg in world.packages:
+                d = abs(pkg[0] - sx) + abs(pkg[1] - sy)
+                if d < best_dist:
+                    best_dist = d
+                    best_pkg = pkg
+            return best_pkg
+        
+        # Nada para fazer
+        return None
+
+    def get_remaining_steps(self, goal, current_steps):
+        """Método auxiliar para calcular passos restantes"""
+        return goal["priority"] - (current_steps - goal["created_at"])
+
 # ==========================
 # CLASSE WORLD (MUNDO)
 # ==========================
 class World:
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, player_class=DefaultPlayer):
         if seed is not None:
             random.seed(seed)
         # Parâmetros do grid e janela
@@ -112,7 +228,7 @@ class World:
         self.goals = []
 
         # Cria o jogador usando a classe DefaultPlayer (pode ser substituído por outra implementação)
-        self.player = self.generate_player()
+        self.player = self.generate_player(player_class)
 
         # Inicializa a janela do Pygame
         pygame.init()
@@ -167,13 +283,13 @@ class World:
             for c in range(top_col, top_col + block_size):
                 self.map[r][c] = 1
 
-    def generate_player(self):
-        # Cria o jogador em uma célula livre que não seja de pacote ou meta.
+    def generate_player(self, player_class):
+        # Cria o jogador em uma célula livre
         while True:
             x = random.randint(0, self.maze_size - 1)
             y = random.randint(0, self.maze_size - 1)
             if self.map[y][x] == 0 and [x, y] not in self.packages:
-                return DefaultPlayer([x, y])
+                return player_class([x, y])
 
     def random_free_cell(self):
         # Retorna uma célula livre que não colida com paredes, pacotes, jogador ou metas existentes
@@ -232,8 +348,8 @@ class World:
 # CLASSE MAZE: Lógica do jogo e planejamento de caminhos (A*)
 # ==========================
 class Maze:
-    def __init__(self, seed=None):
-        self.world = World(seed)
+    def __init__(self, seed=None, player_class=DefaultPlayer):
+        self.world = World(seed, player_class)
         self.running = True
         self.score = 0
         self.steps = 0
@@ -437,8 +553,22 @@ if __name__ == "__main__":
         default=None,
         help="Valor do seed para recriar o mesmo mundo (opcional)."
     )
+    parser.add_argument(
+        "--player",
+        type=str,
+        choices=["default", "bestplayer"],
+        default="default",
+        help="Escolha o tipo de player: 'default' ou 'bestplayer'."
+    )
+
     args = parser.parse_args()
 
-    maze = Maze(seed=args.seed)
-    maze.game_loop()
+    # Escolhe qual player será usado
+    if args.player == "default":
+        player_class = DefaultPlayer
+    else:
+        player_class = BestPlayer
 
+    # Passa a classe do jogador para o Maze
+    maze = Maze(seed=args.seed, player_class=player_class)
+    maze.game_loop()
