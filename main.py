@@ -76,114 +76,151 @@ class BestPlayer(BasePlayer):
     2. Eficiência do caminho total (pacote + entrega)
     3. Penalidades por atrasos
     4. Valor estratégico de cada entrega
+    5. Regras novas:
+       - Ignora metas já vencidas
+       - Prioriza entregas rápidas dentro do prazo
+       - Evita viagens longas que dão prejuízo
     """
+
+    # Parâmetros de ajuste da heurística
+    LATE_PENALTY = 20               # penalidade por passo de atraso
+    SLACK_BONUS_FACTOR = 0.35       # bônus por “folga” (tempo restante após a entrega)
+    PRIORITY_BONUS_FACTOR = 0.2     # bônus por prioridade (quanto menor o número, mais urgente)
+    LONG_TRIP_THRESHOLD = 14        # a partir desta distância total, começa penalização extra
+    LONG_TRIP_QUAD_FACTOR = 0.5     # fator quadrático para punir viagens muito longas
+    MAX_PACKAGE_ONLY_DIST = 8       # limite no fallback para pegar pacote quando não há meta viável
+
+    def get_remaining_steps(self, goal, current_steps):
+        """Passos restantes até estourar a janela da meta (>=0 = ainda no prazo)."""
+        return goal["priority"] - (current_steps - goal["created_at"])
+
+    def long_trip_penalty(self, distance):
+        """Penalização extra para viagens longas (cresce quadraticamente)."""
+        over = max(0, distance - self.LONG_TRIP_THRESHOLD)
+        return (over * over) * self.LONG_TRIP_QUAD_FACTOR
 
     def calculate_delivery_value(self, package_pos, goal, current_steps, player_pos):
         """
-        Calcula o valor estratégico de uma entrega específica (pacote + meta)
+        Calcula valor estratégico de uma entrega específica (coletar pacote + levar à meta).
         Retorna: (score, total_distance, remaining_steps)
+        Quanto menor o score, melhor.
         """
-        # Calcula distâncias
+        # Distâncias (Manhattan)
         dist_to_package = abs(package_pos[0] - player_pos[0]) + abs(package_pos[1] - player_pos[1])
         dist_package_to_goal = abs(goal["pos"][0] - package_pos[0]) + abs(goal["pos"][1] - package_pos[1])
         total_distance = dist_to_package + dist_package_to_goal
-        
-        # Calcula urgência
-        prioridade = goal["priority"]
-        idade = current_steps - goal["created_at"]
-        remaining_steps = prioridade - idade
-        
-        # Calcula score baseado em múltiplos fatores
+
+        # Janela de tempo
+        remaining_steps = self.get_remaining_steps(goal, current_steps)
+
+        # 1) Ignorar metas já vencidas
+        if remaining_steps < 0:
+            return float("inf"), total_distance, remaining_steps
+
+        # Custo base: distância total + penalização extra para viagens longas
+        score = float(total_distance) + self.long_trip_penalty(total_distance)
+
+        # 2) Priorizar entregas rápidas dentro do prazo (bônus de folga e de prioridade)
         if remaining_steps >= total_distance:
-            # Entrega possível dentro do prazo - valor baseado na eficiência
-            time_ratio = remaining_steps / (total_distance + 1)
-            score = total_distance * (1 - min(time_ratio, 2) / 3)  # Bonificação por tempo extra
+            slack = remaining_steps - total_distance  # folga após completar a entrega
+            score -= slack * self.SLACK_BONUS_FACTOR
+
+            # Prioridade: número menor = mais urgente; transformo em bônus
+            # Ex.: priority 40 => bonus maior do que priority 90
+            priority_bonus = (110 - goal["priority"]) * self.PRIORITY_BONUS_FACTOR
+            score -= priority_bonus
+
         else:
-            # Entrega atrasada ou muito apertada - penalidade severa
+            # 3) Evitar viagens que atrasam: penalização pesada
             delay = total_distance - remaining_steps
-            score = total_distance + delay * 15  # Penalidade alta por atraso
-        
-        # Ajusta score baseado na prioridade absoluta (entregas de alta prioridade valem mais)
-        score_adjustment = (110 - prioridade) / 50  # Prioridades mais altas (menores números) valem mais
-        score -= score_adjustment
-        
+            score += delay * self.LATE_PENALTY
+
         return score, total_distance, remaining_steps
 
     def escolher_alvo(self, world, current_steps):
         sx, sy = self.position
-        
-        # Se não está carregando pacotes, escolhe o melhor pacote com base nas metas disponíveis
+
+        # ==========================
+        # CASO 1: Não está carregando → escolher melhor pacote considerando metas viáveis
+        # ==========================
         if self.cargo == 0 and world.packages and world.goals:
             best_score = float('inf')
             best_choice = None
-            best_goal = None
-            
-            # Para cada pacote disponível
-            for pkg in world.packages:
-                # Para cada meta ativa
-                for goal in world.goals:
-                    score, total_dist, remaining = self.calculate_delivery_value(
-                        pkg, goal, current_steps, (sx, sy)
-                    )
-                    
-                    # Debug info
-                    # print(f"Pacote {pkg} + Meta {goal['pos']}: score={score:.2f}, dist={total_dist}, remaining={remaining}")
-                    
-                    if score < best_score:
-                        best_score = score
-                        best_choice = pkg
-                        best_goal = goal
-            
-            # Se encontrou uma combinação boa
-            if best_choice:
-                # print(f"ESCOLHIDO: Pacote {best_choice} para Meta {best_goal['pos']} (score: {best_score:.2f})")
-                return best_choice
-        
-        # Se está carregando pacotes ou não há pacotes mas há metas
+
+            # Considere apenas metas não vencidas
+            viable_goals = [g for g in world.goals if self.get_remaining_steps(g, current_steps) >= 0]
+
+            if viable_goals:
+                for pkg in world.packages:
+                    for goal in viable_goals:
+                        score, total_dist, remaining = self.calculate_delivery_value(
+                            pkg, goal, current_steps, (sx, sy)
+                        )
+                        if score < best_score:
+                            best_score = score
+                            best_choice = pkg
+
+                if best_choice is not None:
+                    return best_choice
+
+            # Se não há combinação pacote+meta viável, evite andar muito sem propósito
+            # Pegue um pacote apenas se for perto; senão retorne None para “esperar”
+            if world.packages:
+                nearest_pkg = min(world.packages, key=lambda p: abs(p[0] - sx) + abs(p[1] - sy))
+                dist_nearest = abs(nearest_pkg[0] - sx) + abs(nearest_pkg[1] - sy)
+                if dist_nearest <= self.MAX_PACKAGE_ONLY_DIST:
+                    return nearest_pkg
+                else:
+                    return None  # aguardar novas metas (idle) é menos custoso que uma viagem longa
+
+        # ==========================
+        # CASO 2: Já está carregando → escolher melhor meta
+        # ==========================
         elif self.cargo > 0 and world.goals:
             best_score = float('inf')
             best_goal_pos = None
-            
-            # Escolhe a meta mais urgente/valiosa para entregar
+
             for goal in world.goals:
-                # Calcula apenas a parte de entrega (já temos o pacote)
+                remaining = self.get_remaining_steps(goal, current_steps)
+                # ignorar metas vencidas
+                if remaining < 0:
+                    continue
+
                 dist_to_goal = abs(goal["pos"][0] - sx) + abs(goal["pos"][1] - sy)
-                prioridade = goal["priority"]
-                idade = current_steps - goal["created_at"]
-                remaining_steps = prioridade - idade
-                
-                if remaining_steps >= dist_to_goal:
-                    score = dist_to_goal * 0.8  # Bonificação por estar já carregado
+
+                # custo base: distância + penalização de viagem longa
+                score = float(dist_to_goal) + self.long_trip_penalty(dist_to_goal)
+
+                if remaining >= dist_to_goal:
+                    # dentro do prazo → bônus de folga e prioridade
+                    slack = remaining - dist_to_goal
+                    score -= slack * self.SLACK_BONUS_FACTOR
+                    score -= (110 - goal["priority"]) * self.PRIORITY_BONUS_FACTOR
                 else:
-                    delay = dist_to_goal - remaining_steps
-                    score = dist_to_goal + delay * 10
-                
-                # Ajusta por prioridade
-                score -= (110 - prioridade) / 40
-                
+                    # vai atrasar → penalidade pesada
+                    delay = dist_to_goal - remaining
+                    score += delay * self.LATE_PENALTY
+
                 if score < best_score:
                     best_score = score
                     best_goal_pos = goal["pos"]
-            
+
             return best_goal_pos
-        
-        # Fallback: se não há metas mas há pacotes, pega o pacote mais próximo
+
+        # ==========================
+        # CASO 3: Fallback (sem metas viáveis) → pegar pacote próximo apenas se não for longe
+        # ==========================
         elif self.cargo == 0 and world.packages:
-            best_dist = float('inf')
-            best_pkg = None
-            for pkg in world.packages:
-                d = abs(pkg[0] - sx) + abs(pkg[1] - sy)
-                if d < best_dist:
-                    best_dist = d
-                    best_pkg = pkg
-            return best_pkg
-        
-        # Nada para fazer
+            best_pkg = min(world.packages, key=lambda p: abs(p[0] - sx) + abs(p[1] - sy))
+            d = abs(best_pkg[0] - sx) + abs(best_pkg[1] - sy)
+            if d <= self.MAX_PACKAGE_ONLY_DIST:
+                return best_pkg
+            else:
+                return None  # esperar é melhor do que se comprometer com viagem longa inútil
+
+        # Nada a fazer
         return None
 
-    def get_remaining_steps(self, goal, current_steps):
-        """Método auxiliar para calcular passos restantes"""
-        return goal["priority"] - (current_steps - goal["created_at"])
 
 # ==========================
 # CLASSE WORLD (MUNDO)
@@ -456,14 +493,46 @@ class Maze:
             # Spawns podem ocorrer antes mesmo de escolher alvo
             self.maybe_spawn_goal()
 
-            # Escolhe o alvo apenas quando não há alvo corrente
+                        # Escolhe o alvo apenas quando não há alvo corrente
             if self.current_target is None:
                 target = self.world.player.escolher_alvo(self.world, self.steps)
-                # Se não há nada para fazer agora, aguardamos (tick ocioso) até surgir algo
+
+                # Se não há nada para fazer agora...
                 if target is None:
-                    self.idle_tick()
-                    continue
-                self.current_target = target
+                    # Se ainda houver spawns futuros, aguardamos (com idle tick)
+                    if self.next_spawn_step is not None:
+                        self.idle_tick()
+                        continue
+
+                    # --- NÃO HÁ MAIS SPAWNS FUTUROS: força um fallback para evitar deadlock ---
+                    # 1) Se o jogador NÃO está carregando, vá buscar o pacote mais próximo (mesmo que longe)
+                    if self.world.player.cargo == 0 and self.world.packages:
+                        nearest_pkg = min(
+                            self.world.packages,
+                            key=lambda p: abs(p[0] - self.world.player.position[0]) + abs(p[1] - self.world.player.position[1])
+                        )
+                        self.current_target = nearest_pkg
+                        # segue abaixo para planejar caminho até esse pacote
+
+                    # 2) Se o jogador está carregando mas não existem goals (ou estão todas vencidas),
+                    #    tente entregar para a meta mais próxima (mesmo que gere atraso)
+                    elif self.world.player.cargo > 0 and self.world.goals:
+                        nearest_goal_pos = min(
+                            (g["pos"] for g in self.world.goals),
+                            key=lambda pos: abs(pos[0] - self.world.player.position[0]) + abs(pos[1] - self.world.player.position[1])
+                        )
+                        self.current_target = nearest_goal_pos
+
+                    # 3) Nada para fazer — encerra para evitar loop infinito
+                    else:
+                        print("Nenhuma ação possível e sem spawns futuros — encerrando para evitar deadlock.")
+                        self.running = False
+                        break
+
+                else:
+                    # havia um alvo retornado por escolher_alvo -> usar normalmente
+                    self.current_target = target
+
 
             # Planeja caminho até o alvo corrente
             self.path = self.astar(self.world.player.position, self.current_target)
