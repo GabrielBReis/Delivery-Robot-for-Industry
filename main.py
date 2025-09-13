@@ -18,7 +18,7 @@ class BasePlayer(ABC):
         self.cargo = 0            # Número de pacotes atualmente carregados
 
     @abstractmethod
-    def escolher_alvo(self, world):
+    def escolher_alvo(self, world, current_steps):
         """
         Retorna o alvo (posição) que o jogador deseja ir.
         Recebe o objeto world para acesso a pacotes e metas.
@@ -26,22 +26,19 @@ class BasePlayer(ABC):
         pass
 
 class DefaultPlayer(BasePlayer):
-
-    # Exemplo de como acessar prioridade de um objetivo
-    # Se idade > prioridade você começa a levar uma multa de -1 por passo por pacote
     def get_remaining_steps(self, goal, current_steps):
         prioridade = goal["priority"]
         idade = current_steps - goal["created_at"]  # para medir o atraso    
-        print(f"Goal em {goal['pos']} tem prioridade {prioridade} e idade {idade}")    
         return prioridade - idade
+
     """
     Implementação padrão do jogador.
     Se não estiver carregando pacotes (cargo == 0), escolhe o pacote mais próximo.
-    Caso contrário, escolhe a meta (entrega) mais próxima.
+    Caso contrário, escolhe a meta (entrega) mais próxima considerando prioridade.
     """
     def escolher_alvo(self, world, current_steps):
-        # Lógica simples 
         sx, sy = self.position
+        
         # Se não estiver carregando pacote e houver pacotes disponíveis:
         if self.cargo == 0 and world.packages:
             best = None
@@ -56,15 +53,27 @@ class DefaultPlayer(BasePlayer):
             # Se estiver carregando ou não houver mais pacotes, vai para a meta de entrega (se existir)
             if world.goals:
                 best = None
-                best_dist = float('inf')
+                best_score = float('-inf')
+                
                 for goal in world.goals:
                     gx, gy = goal["pos"]
-                    d = abs(gx - sx) + abs(gy - sy)
-                    if d < best_dist:
-                        best_dist = d
+                    distancia = abs(gx - sx) + abs(gy - sy)
+                    
+                    # Calcula urgência (quanto menor o tempo restante, mais urgente)
+                    tempo_restante = self.get_remaining_steps(goal, current_steps)
+                    
+                    # Se a meta já está atrasada, prioriza extremamente
+                    if tempo_restante < 0:
+                        score = 10000 + abs(tempo_restante)  # Quanto mais atrasado, maior a prioridade
+                    else:
+                        # Score que considera tanto distância quanto urgência
+                        # Quanto menor a distância e menor o tempo restante, maior o score
+                        score = (100 / (distancia + 1)) + (50 / (tempo_restante + 1))
+                    
+                    if score > best_score:
+                        best_score = score
                         best = goal["pos"]
                 
-                steps_for_deadline = self.get_remaining_steps(goal, current_steps)    
                 return best
             else:
                 return None
@@ -120,17 +129,26 @@ class World:
         pygame.display.set_caption("Delivery Bot")
 
         # Carrega imagens para pacote e meta a partir de arquivos
-        self.package_image = pygame.image.load("images/cargo.png")
-        self.package_image = pygame.transform.scale(self.package_image, (self.block_size, self.block_size))
+        # Se as imagens não existirem, usaremos cores
+        try:
+            self.package_image = pygame.image.load("images/cargo.png")
+            self.package_image = pygame.transform.scale(self.package_image, (self.block_size, self.block_size))
+        except:
+            self.package_image = None
 
-        self.goal_image = pygame.image.load("images/operator.png")
-        self.goal_image = pygame.transform.scale(self.goal_image, (self.block_size, self.block_size))
+        try:
+            self.goal_image = pygame.image.load("images/operator.png")
+            self.goal_image = pygame.transform.scale(self.goal_image, (self.block_size, self.block_size))
+        except:
+            self.goal_image = None
 
         # Cores utilizadas para desenho (caso a imagem não seja usada)
         self.wall_color = (100, 100, 100)
         self.ground_color = (255, 255, 255)
         self.player_color = (0, 255, 0)
         self.path_color = (200, 200, 0)
+        self.package_color = (0, 0, 255)  # Azul para pacotes
+        self.goal_color = (255, 0, 0)     # Vermelho para metas
 
     def generate_obstacles(self):
         """
@@ -206,14 +224,30 @@ class World:
         for (x, y) in self.walls:
             rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
             pygame.draw.rect(self.screen, self.wall_color, rect)
-        # Desenha os locais de coleta (pacotes) utilizando a imagem
+        
+        # Desenha os locais de coleta (pacotes)
         for pkg in self.packages:
             x, y = pkg
-            self.screen.blit(self.package_image, (x * self.block_size, y * self.block_size))
-        # Desenha os locais de entrega (metas) utilizando a imagem
+            if self.package_image:
+                self.screen.blit(self.package_image, (x * self.block_size, y * self.block_size))
+            else:
+                rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
+                pygame.draw.rect(self.screen, self.package_color, rect)
+        
+        # Desenha os locais de entrega (metas)
         for goal in self.goals:
             x, y = goal["pos"]
-            self.screen.blit(self.goal_image, (x * self.block_size, y * self.block_size))
+            # Calcula a cor com base na urgência (mais vermelho = mais urgente)
+            idade = pygame.time.get_ticks() // 1000 - goal["created_at"]
+            urgência = max(0, min(255, int(255 * (idade / goal["priority"]))))
+            cor_meta = (255, 255 - urgência, 255 - urgência)
+            
+            if self.goal_image:
+                self.screen.blit(self.goal_image, (x * self.block_size, y * self.block_size))
+            else:
+                rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
+                pygame.draw.rect(self.screen, cor_meta, rect)
+        
         # Desenha o caminho, se fornecido
         if path:
             for pos in path:
@@ -222,10 +256,20 @@ class World:
                                    y * self.block_size + self.block_size // 4,
                                    self.block_size // 2, self.block_size // 2)
                 pygame.draw.rect(self.screen, self.path_color, rect)
+        
         # Desenha o jogador (retângulo colorido)
         x, y = self.player.position
         rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
         pygame.draw.rect(self.screen, self.player_color, rect)
+        
+        # Exibe informações de prioridade
+        font = pygame.font.SysFont(None, 24)
+        for goal in self.goals:
+            x, y = goal["pos"]
+            tempo_restante = goal["priority"] - (pygame.time.get_ticks() // 1000 - goal["created_at"])
+            text = font.render(str(tempo_restante), True, (0, 0, 0))
+            self.screen.blit(text, (x * self.block_size + 5, y * self.block_size + 5))
+        
         pygame.display.flip()
 
 # ==========================
@@ -243,6 +287,7 @@ class Maze:
 
         # Spawn de metas (goals) ao longo do tempo:
         # 2 metas iniciais no passo 0
+        self.world.add_goal(created_at_step=0)
         self.world.add_goal(created_at_step=0)
 
         # Fila de intervalos para novas metas:
@@ -400,12 +445,18 @@ class Maze:
                         self.world.player.cargo -= 1
                         self.num_deliveries += 1
                         self.world.goals.remove(goal)
-                        self.score += 50
+                        
+                        # Calcula bônus com base no tempo restante
+                        tempo_restante = goal["priority"] - (self.steps - goal["created_at"])
+                        bonus = 50 + max(0, tempo_restante)  # Bônus adicional por entregar com antecedência
+                        self.score += bonus
+                        
                         print(
                             f"Pacote entregue em {self.current_target} | "
                             f"Cargo: {self.world.player.cargo} | "
                             f"Priority: {goal['priority']} | "
-                            f"Age: {self.steps - goal['created_at']}"
+                            f"Age: {self.steps - goal['created_at']} | "
+                            f"Bonus: {bonus}"
                         )
 
             # Reset do alvo para permitir nova decisão no próximo ciclo (sem trocar durante o trajeto)
