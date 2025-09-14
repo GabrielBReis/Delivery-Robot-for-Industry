@@ -71,14 +71,14 @@ class DefaultPlayer(BasePlayer):
 class BestPlayer(BasePlayer):
     def get_remaining_steps(self, goal, current_steps):
         prioridade = goal["priority"]
-        idade = current_steps - goal["created_at"]  # para medir o atraso    
-        print(f"Goal em {goal['pos']} tem prioridade {prioridade} e idade {idade}")    
+        idade = current_steps - goal["created_at"]  # para medir o atraso   
+        print(f"Goal em {goal['pos']} tem prioridade {prioridade} e idade {idade}")     
         return prioridade - idade
 
     """
-    Implementação padrão do jogador.
-    Se não estiver carregando pacotes (cargo == 0), escolhe o pacote mais próximo.
-    Caso contrário, escolhe a meta (entrega) mais próxima considerando prioridade.
+    Estratégia avançada:
+    - Se não estiver carregando pacotes → pega o pacote mais próximo.
+    - Se estiver carregando → escolhe meta considerando prioridade e urgência.
     """
     def escolher_alvo(self, world, current_steps):
         sx, sy = self.position
@@ -94,7 +94,18 @@ class BestPlayer(BasePlayer):
                     best = pkg
             return best
         else:
-            # Se estiver carregando ou não houver mais pacotes, vai para a meta de entrega (se existir)
+            # 🔹 NOVA REGRA: Se tiver carga e houver mais de uma entrega próxima (<= 3 blocos)
+            if self.cargo > 0:
+                nearby_goals = [
+                    g for g in world.goals
+                    if abs(g["pos"][0] - sx) + abs(g["pos"][1] - sy) <= 3
+                ]
+                if len(nearby_goals) > 1:
+                    # entrega primeiro a mais próxima
+                    closest = min(nearby_goals, key=lambda g: abs(g["pos"][0] - sx) + abs(g["pos"][1] - sy))
+                    return closest["pos"]
+
+            # Estratégia normal: escolher meta com base em prioridade/urgência
             if world.goals:
                 best = None
                 best_score = float('-inf')
@@ -103,15 +114,12 @@ class BestPlayer(BasePlayer):
                     gx, gy = goal["pos"]
                     distancia = abs(gx - sx) + abs(gy - sy)
                     
-                    # Calcula urgência (quanto menor o tempo restante, mais urgente)
+                    # Calcula urgência
                     tempo_restante = self.get_remaining_steps(goal, current_steps)
                     
-                    # Se a meta já está atrasada, prioriza extremamente
                     if tempo_restante < 0:
-                        score = 10000 + abs(tempo_restante)  # Quanto mais atrasado, maior a prioridade
+                        score = 10000 + abs(tempo_restante)  # Altíssima prioridade se atrasado
                     else:
-                        # Score que considera tanto distância quanto urgência
-                        # Quanto menor a distância e menor o tempo restante, maior o score
                         score = (100 / (distancia + 1)) + (50 / (tempo_restante + 1))
                     
                     if score > best_score:
@@ -122,6 +130,47 @@ class BestPlayer(BasePlayer):
             else:
                 return None
 
+class ClusterSweepPlayer(BestPlayer):
+    FORCE_SWEEP_RADIUS = 6
+
+    def _safe_path_length(self, world, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _overdue_count_at(self, world, steps_at_time):
+        cnt = 0
+        for g in world.goals:
+            age = steps_at_time - g["created_at"]
+            if age > g["priority"]:
+                cnt += 1
+        return cnt
+
+    def _forced_sweep_next(self, world, current_pos):
+        if not world.packages:
+            return None
+        cand = []
+        for p in world.packages:
+            L = self._safe_path_length(world, current_pos, p)
+            if L <= self.FORCE_SWEEP_RADIUS:
+                cand.append((L, p))
+        if not cand:
+            return None
+        cand.sort(key=lambda t: t[0])
+        return cand[0][1]
+
+    def _forced_sweep_decide(self, world, current_steps):
+        if self._overdue_count_at(world, current_steps) > 0:
+            return None
+        nxt = self._forced_sweep_next(world, self.position)
+        if nxt is not None:
+            return nxt
+        return None
+
+    def escolher_alvo(self, world, current_steps):
+        sweep_target = self._forced_sweep_decide(world, current_steps)
+        if sweep_target:
+            return sweep_target
+        return super().escolher_alvo(world, current_steps)
+    
 # ==========================
 # CLASSE WORLD (MUNDO)
 # ==========================
@@ -129,30 +178,16 @@ class World:
     def __init__(self, seed=None, player_class=DefaultPlayer):
         if seed is not None:
             random.seed(seed)
-        # Parâmetros do grid e janela
         self.maze_size = 30
         self.width = 600
         self.height = 600
         self.block_size = self.width // self.maze_size
 
-        # Cria uma matriz 2D para planejamento de caminhos:
-        # 0 = livre, 1 = obstáculo
         self.map = [[0 for _ in range(self.maze_size)] for _ in range(self.maze_size)]
-        # Geração de obstáculos com padrão de linha (assembly line)
         self.generate_obstacles()
-        # Gera a lista de paredes a partir da matriz
-        self.walls = []
-        for row in range(self.maze_size):
-            for col in range(self.maze_size):
-                if self.map[row][col] == 1:
-                    self.walls.append((col, row))
+        self.walls = [(col, row) for row in range(self.maze_size) for col in range(self.maze_size) if self.map[row][col] == 1]
 
-        # Número total de entregas (metas) planejadas ao longo do jogo
-        # 2 iniciais + 1 após 2–5 passos + 3 extras com janelas de 10–15 passos = 6
         self.total_items = 6
-
-        # Geração dos locais de coleta (pacotes)
-        # Mantemos uma folga de um a mais que o total de entregas
         self.packages = []
         while len(self.packages) < self.total_items + 1:
             x = random.randint(0, self.maze_size - 1)
@@ -160,41 +195,26 @@ class World:
             if self.map[y][x] == 0 and [x, y] not in self.packages:
                 self.packages.append([x, y])
 
-        # Metas (goals) com surgimento ao longo do tempo
-        # Estrutura de cada goal: {"pos":[x,y], "priority":int, "created_at":steps_int}
         self.goals = []
-
-        # Cria o jogador usando a classe DefaultPlayer (pode ser substituído por outra implementação)
         self.player = self.generate_player(player_class)
 
-        # Inicializa a janela do Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Delivery Bot")
 
-        # Carrega imagens para pacote e meta a partir de arquivos
         self.package_image = pygame.image.load("images/cargo.png")
         self.package_image = pygame.transform.scale(self.package_image, (self.block_size, self.block_size))
-
         self.goal_image = pygame.image.load("images/operator.png")
         self.goal_image = pygame.transform.scale(self.goal_image, (self.block_size, self.block_size))
 
-        # Cores utilizadas para desenho (caso a imagem não seja usada)
         self.wall_color = (100, 100, 100)
         self.ground_color = (255, 255, 255)
         self.player_color = (0, 255, 0)
         self.path_color = (200, 200, 0)
-        self.package_color = (0, 0, 255)  # Azul para pacotes
-        self.goal_color = (255, 0, 0)     # Vermelho para metas
+        self.package_color = (0, 0, 255)
+        self.goal_color = (255, 0, 0)
 
     def generate_obstacles(self):
-        """
-        Gera obstáculos com sensação de linha de montagem:
-         - Cria vários segmentos horizontais curtos com lacunas.
-         - Cria vários segmentos verticais curtos com lacunas.
-         - Cria um obstáculo em bloco grande (4x4 ou 6x6) simulando uma estrutura de suporte.
-        """
-        # Barragens horizontais curtas:
         for _ in range(7):
             row = random.randint(5, self.maze_size - 6)
             start = random.randint(0, self.maze_size - 10)
@@ -203,7 +223,6 @@ class World:
                 if random.random() < 0.7:
                     self.map[row][col] = 1
 
-        # Barragens verticais curtas:
         for _ in range(7):
             col = random.randint(5, self.maze_size - 6)
             start = random.randint(0, self.maze_size - 10)
@@ -212,7 +231,6 @@ class World:
                 if random.random() < 0.7:
                     self.map[row][col] = 1
 
-        # Obstáculo em bloco grande: bloco de tamanho 4x4 ou 6x6.
         block_size = random.choice([4, 6])
         max_row = self.maze_size - block_size
         max_col = self.maze_size - block_size
@@ -223,15 +241,13 @@ class World:
                 self.map[r][c] = 1
 
     def generate_player(self, player_class):
-        # Cria o jogador em uma célula livre que não seja de pacote ou meta.
         while True:
             x = random.randint(0, self.maze_size - 1)
             y = random.randint(0, self.maze_size - 1)
             if self.map[y][x] == 0 and [x, y] not in self.packages:
-                return player_class([x, y])  # Usa a player_class passada como parâmetro
+                return player_class([x, y])
 
     def random_free_cell(self):
-        # Retorna uma célula livre que não colida com paredes, pacotes, jogador ou metas existentes
         while True:
             x = random.randint(0, self.maze_size - 1)
             y = random.randint(0, self.maze_size - 1)
@@ -242,7 +258,7 @@ class World:
                 any(g["pos"] == [x, y] for g in self.goals)
             )
             if not occupied:
-                return [x, y]  # Retorna apenas as coordenadas, não um objeto player
+                return [x, y]
 
     def add_goal(self, created_at_step):
         pos = self.random_free_cell()
@@ -251,18 +267,14 @@ class World:
 
     def can_move_to(self, pos):
         x, y = pos
-        if 0 <= x < self.maze_size and 0 <= y < self.maze_size:
-            return self.map[y][x] == 0
-        return False
+        return 0 <= x < self.maze_size and 0 <= y < self.maze_size and self.map[y][x] == 0
 
     def draw_world(self, path=None):
         self.screen.fill(self.ground_color)
-        # Desenha os obstáculos (paredes)
         for (x, y) in self.walls:
             rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
             pygame.draw.rect(self.screen, self.wall_color, rect)
         
-        # Desenha os locais de coleta (pacotes)
         for pkg in self.packages:
             x, y = pkg
             if self.package_image:
@@ -271,10 +283,8 @@ class World:
                 rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
                 pygame.draw.rect(self.screen, self.package_color, rect)
         
-        # Desenha os locais de entrega (metas)
         for goal in self.goals:
             x, y = goal["pos"]
-            # Calcula a cor com base na urgência (mais vermelho = mais urgente)
             idade = pygame.time.get_ticks() // 1000 - goal["created_at"]
             urgência = max(0, min(255, int(255 * (idade / goal["priority"]))))
             cor_meta = (255, 255 - urgência, 255 - urgência)
@@ -285,7 +295,6 @@ class World:
                 rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
                 pygame.draw.rect(self.screen, cor_meta, rect)
         
-        # Desenha o caminho, se fornecido
         if path:
             for pos in path:
                 x, y = pos
@@ -294,12 +303,10 @@ class World:
                                    self.block_size // 2, self.block_size // 2)
                 pygame.draw.rect(self.screen, self.path_color, rect)
         
-        # Desenha o jogador (retângulo colorido)
         x, y = self.player.position
         rect = pygame.Rect(x * self.block_size, y * self.block_size, self.block_size, self.block_size)
         pygame.draw.rect(self.screen, self.player_color, rect)
         
-        # Exibe informações de prioridade
         font = pygame.font.SysFont(None, 24)
         for goal in self.goals:
             x, y = goal["pos"]
@@ -308,6 +315,7 @@ class World:
             self.screen.blit(text, (x * self.block_size + 5, y * self.block_size + 5))
         
         pygame.display.flip()
+
 
 # ==========================
 # CLASSE MAZE: Lógica do jogo e planejamento de caminhos (A*)
@@ -318,25 +326,19 @@ class Maze:
         self.running = True
         self.score = 0
         self.steps = 0
-        self.delay = 100  # milissegundos entre movimentos
+        self.delay = 100
         self.path = []
-        self.num_deliveries = 0  # contagem de entregas realizadas
+        self.num_deliveries = 0
 
-        # Spawn de metas (goals) ao longo do tempo:
-        # 2 metas iniciais no passo 0
         self.world.add_goal(created_at_step=0)
         self.world.add_goal(created_at_step=0)
 
-        # Fila de intervalos para novas metas:
-        # +1 meta após 2–5 passos; +3 metas com intervalos de 10–15 passos entre si
         self.spawn_intervals = [random.randint(2, 5)] + [random.randint(5, 10)] + [random.randint(10, 15) for _ in range(3)]
-        self.next_spawn_step = self.spawn_intervals.pop(0)  # passo absoluto do próximo spawn
+        self.next_spawn_step = self.spawn_intervals.pop(0)
 
-        # O alvo corrente é fixado até ser alcançado (não muda se surgirem novas metas)
         self.current_target = None
 
     def heuristic(self, a, b):
-        # Distância de Manhattan
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def astar(self, start, goal):
@@ -377,22 +379,20 @@ class Maze:
         return []
 
     def maybe_spawn_goal(self):
-        # Spawna metas conforme a agenda de passos
         while self.next_spawn_step is not None and self.steps >= self.next_spawn_step:
             self.world.add_goal(created_at_step=self.steps)
             if self.spawn_intervals:
                 self.next_spawn_step += self.spawn_intervals.pop(0)
             else:
-                self.next_spawn_step = None  # sem mais spawns
+                self.next_spawn_step = None
 
     def delayed_goals_penalty(self):
-        # Conta quantas metas abertas estouraram sua prioridade
         delayed = 0
         for g in self.world.goals:
             age = self.steps - g["created_at"]
             if age > g["priority"]:
                 delayed += 1
-        return delayed  # -1 por goal atrasado
+        return delayed
 
     def get_goal_at(self, pos):
         for g in self.world.goals:
@@ -401,63 +401,43 @@ class Maze:
         return None
 
     def idle_tick(self):
-        # Um "passo" sem movimento: avança tempo, aplica penalidades e redesenha
         self.steps += 1
-        # Custo base por passo
         self.score -= 1
-        # Penalidade adicional por metas atrasadas
         self.score -= self.delayed_goals_penalty()
-        # Spawns que podem acontecer neste passo
         self.maybe_spawn_goal()
         self.world.draw_world(self.path)
         pygame.time.wait(self.delay)
 
     def game_loop(self):
-        # O jogo termina quando o número de entregas realizadas é igual ao total de itens.
         while self.running:
             if self.num_deliveries >= self.world.total_items:
                 self.running = False
                 break
 
-            # Spawns podem ocorrer antes mesmo de escolher alvo
             self.maybe_spawn_goal()
 
-            # Escolhe o alvo apenas quando não há alvo corrente
             if self.current_target is None:
                 target = self.world.player.escolher_alvo(self.world, self.steps)
-                # Se não há nada para fazer agora, aguardamos (tick ocioso) até surgir algo
                 if target is None:
                     self.idle_tick()
                     continue
                 self.current_target = target
 
-            # Planeja caminho até o alvo corrente
             self.path = self.astar(self.world.player.position, self.current_target)
             if not self.path:
                 print("Nenhum caminho encontrado para o alvo", self.current_target)
                 self.running = False
                 break
 
-            # Segue o caminho calculado (não muda o alvo durante o trajeto)
             for pos in self.path:
-                # Move
                 self.world.player.position = pos
                 self.steps += 1
-
-                # Custo base por movimento
                 self.score -= 1
-
-                # Penalidade por metas atrasadas
                 self.score -= self.delayed_goals_penalty()
-
-                # Spawns podem ocorrer durante o trajeto
                 self.maybe_spawn_goal()
-
-                # Desenha
                 self.world.draw_world(self.path)
                 pygame.time.wait(self.delay)
 
-                # Eventos do pygame (fechar janela, etc.)
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
@@ -468,30 +448,34 @@ class Maze:
             if not self.running:
                 break
 
-            # Ao chegar ao alvo, processa a coleta ou entrega:
             if self.world.player.position == self.current_target:
-                # Se for local de coleta, pega o pacote.
                 if self.current_target in self.world.packages:
                     self.world.player.cargo += 1
                     self.world.packages.remove(self.current_target)
                     print("Pacote coletado em", self.current_target, "Cargo agora:", self.world.player.cargo)
                 else:
-                    # Se for local de entrega e o jogador tiver pelo menos um pacote, entrega.
                     goal = self.get_goal_at(self.current_target)
                     if goal is not None and self.world.player.cargo > 0:
                         self.world.player.cargo -= 1
                         self.num_deliveries += 1
                         self.world.goals.remove(goal)
-                        self.score += 50
+                        
+                        # tempo_restante = goal["priority"] - (self.steps - goal["created_at"])
+                        # bonus = 50 + max(0, tempo_restante)
+                        bonus = 50
+                        self.score += bonus
+                        
                         print(
                             f"Pacote entregue em {self.current_target} | "
                             f"Cargo: {self.world.player.cargo} | "
                             f"Priority: {goal['priority']} | "
                             f"Age: {self.steps - goal['created_at']}"
+                            #f"Tempo restante: {tempo_restante} | "
+                            f"Bônus: {bonus} | "
+                            f"Score: {self.score}"
                         )
 
-            # Reset do alvo para permitir nova decisão no próximo ciclo (sem trocar durante o trajeto)
-            self.current_target = None
+                self.current_target = None
 
             # Log simples de estado
             delayed_count = sum(1 for g in self.world.goals if (self.steps - g["created_at"]) > g["priority"])
@@ -500,14 +484,14 @@ class Maze:
                 f"Entregas: {self.num_deliveries}| Goals ativos: {len(self.world.goals)}| "
                 f"Atrasados: {delayed_count}"
             )
-
-        print("Fim de jogo!")
+            
+        print(f"Entregas concluídas: {self.num_deliveries}/{self.world.total_items}")
         print("Total de passos:", self.steps)
         print("Pontuação final:", self.score)
         pygame.quit()
 
 # ==========================
-# PONTO DE ENTRADA PRINCIPAL
+# MAIN
 # ==========================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -522,19 +506,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--player",
         type=str,
-        choices=["default", "bestplayer"],
+        choices=["default", "bestplayer", "clustersweep"],
         default="default",
-        help="Escolha o tipo de player: 'default' ou 'bestplayer'."
+        help="Escolha o tipo de player: 'default', 'bestplayer' ou 'clustersweep'."
     )
 
     args = parser.parse_args()
 
-    # Escolhe qual player será usado
+    # Escolhe a classe do player com base no argumento
     if args.player == "default":
         player_class = DefaultPlayer
-    else:
+    elif args.player == "bestplayer":
         player_class = BestPlayer
+    else:
+        player_class = ClusterSweepPlayer
 
-    # Passa a classe do jogador para o Maze
     maze = Maze(seed=args.seed, player_class=player_class)
     maze.game_loop()
