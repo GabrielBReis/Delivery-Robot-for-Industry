@@ -134,134 +134,6 @@ class ClusterSweepPlayer(BasePlayer):
                 else:
                     return None
 
-class BestPlayer(BasePlayer):
-    def __init__(self, position):
-        super().__init__(position)
-        self.next_target = None
-        self.collection_radius = 6  # Raio para coleta prioritária
-        self.delivery_radius = 8    # Raio para entrega prioritária
-
-    def get_remaining_steps(self, goal, current_steps):
-        prioridade = goal["priority"]
-        idade = current_steps - goal["created_at"]   
-        return prioridade - idade
-
-    def escolher_alvo(self, world, current_steps):
-        sx, sy = self.position
-
-        # Se já tem próximo alvo programado, segue nele
-        if self.next_target:
-            target = self.next_target
-            self.next_target = None
-            return target
-
-        # --- COLETA DE PACOTES ---
-        if self.cargo == 0 and world.packages:
-            # Pega o pacote mais próximo dentro do raio de coleta
-            close_pkgs = [
-                pkg for pkg in world.packages
-                if abs(pkg[0]-sx) + abs(pkg[1]-sy) <= self.collection_radius
-            ]
-            
-            if close_pkgs:
-                return min(close_pkgs, key=lambda pkg: abs(pkg[0]-sx) + abs(pkg[1]-sy))
-            else:
-                # Se não há pacotes próximos, pega o mais próximo geral
-                return min(world.packages, key=lambda pkg: abs(pkg[0]-sx) + abs(pkg[1]-sy))
-        
-        # Se já está carregando, só pega outro pacote se estiver muito perto (≤3 blocos)
-        elif self.cargo >= 1 and world.packages:
-            very_close_pkgs = [
-                pkg for pkg in world.packages
-                if abs(pkg[0]-sx) + abs(pkg[1]-sy) <= 10
-            ]
-            if very_close_pkgs:
-                return min(very_close_pkgs, key=lambda pkg: abs(pkg[0]-sx) + abs(pkg[1]-sy))
-
-        # --- ENTREGA DE PACOTES ---
-        if self.cargo > 0 and world.goals:
-            # 1) Verifica se há metas muito próximas (dentro do raio de entrega)
-            nearby_goals = [
-                g for g in world.goals
-                if abs(g["pos"][0] - sx) + abs(g["pos"][1] - sy) <= self.delivery_radius
-            ]
-            
-            if nearby_goals:
-                # Entrega primeiro as mais próximas, considerando também o prazo
-                best_nearby = min(nearby_goals, key=lambda g: 
-                    (abs(g["pos"][0]-sx) + abs(g["pos"][1]-sy)) * 2 - 
-                    self.get_remaining_steps(g, current_steps))
-                return best_nearby["pos"]
-
-            # 2) Se não há metas próximas, escolhe com base no custo-benefício distância x prazo
-            return self._choose_best_goal(world, current_steps, sx, sy)
-
-        return None
-
-    def _choose_best_goal(self, world, current_steps, sx, sy):
-        best = None
-        best_score = float('-inf')
-        
-        for goal in world.goals:
-            gx, gy = goal["pos"]
-            distancia = abs(gx - sx) + abs(gy - sy)
-            tempo_restante = self.get_remaining_steps(goal, current_steps)
-            
-            # Fórmula melhorada: balanceia melhor distância e prazo
-            if tempo_restante <= 0:  # Já está atrasado - máxima prioridade
-                score = 10000 - distancia  # Prioriza os atrasados mais próximos
-            else:
-                # Calcula um score que considera tanto a urgência quanto a distância
-                # Quanto menor o tempo restante e menor a distância, maior o score
-                score = (100 / max(1, distancia)) * 3 + (tempo_restante * 2)
-            
-            if score > best_score:
-                best_score = score
-                best = goal["pos"]
-                
-        return best
-
-# class ClusterSweepPlayer(BestPlayer):
-#     def __init__(self, position):
-#         super().__init__(position)
-#         self.FORCE_SWEEP_RADIUS = 6
-
-#     def _safe_path_length(self, a, b):
-#         return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-#     def _overdue_count_at(self, world, steps_at_time):
-#         return sum(
-#             1 for g in world.goals
-#             if (steps_at_time - g["created_at"]) > g["priority"]
-#         )
-
-#     def _forced_sweep_next(self, world, current_pos):
-#         if not world.packages:
-#             return None
-#         cand = [
-#             (self._safe_path_length(current_pos, p), p)
-#             for p in world.packages
-#             if self._safe_path_length(current_pos, p) <= self.FORCE_SWEEP_RADIUS
-#         ]
-#         return min(cand, key=lambda t: t[0])[1] if cand else None
-
-#     def _forced_sweep_decide(self, world, current_steps):
-#         # Só faz a varredura forçada se não houver entregas atrasadas
-#         if self._overdue_count_at(world, current_steps) > 0:
-#             return None
-#         return self._forced_sweep_next(world, self.position)
-
-#     def escolher_alvo(self, world, current_steps):
-#         # Verifica primeiro se deve fazer uma varredura forçada
-#         sweep_target = self._forced_sweep_decide(world, current_steps)
-#         if sweep_target:
-#             return sweep_target
-
-#         # Caso contrário, usa a lógica melhorada do BestPlayer
-#         return super().escolher_alvo(world, current_steps)
-
-
-    
 # ==========================
 # CLASSE WORLD (MUNDO)
 # ==========================
@@ -640,10 +512,12 @@ class Maze:
         pygame.quit()
 
 
-import pandas as pd
+import pandas as pd 
 import matplotlib
 matplotlib.use('Agg')  # evita problemas em ambientes sem GUI
 import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
 class Simulator:
     def __init__(self, player_class, num_runs=40, seed=None):
@@ -693,8 +567,163 @@ class Simulator:
         return desc
 
     # ==========================
-    # Gráficos de Comparação
+    # NOVOS GRÁFICOS
     # ==========================
+    @staticmethod
+    def compare_boxplot_with_points(csv_files, labels, column, ylabel, title, save_as):
+        dfs = [pd.read_csv(f).assign(Jogador=label) for f, label in zip(csv_files, labels)]
+        df_all = pd.concat(dfs)
+
+        plt.figure(figsize=(8,5))
+        sns.boxplot(data=df_all, x="Jogador", y=column, showfliers=False)
+        sns.stripplot(data=df_all, x="Jogador", y=column, color="black", alpha=0.5)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_violinplot(csv_files, labels, column, ylabel, title, save_as):
+        dfs = [pd.read_csv(f).assign(Jogador=label) for f, label in zip(csv_files, labels)]
+        df_all = pd.concat(dfs)
+
+        plt.figure(figsize=(8,5))
+        sns.violinplot(data=df_all, x="Jogador", y=column, inner="quartile")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_line_per_seed(csv_files, labels, column, ylabel, title, save_as):
+        df1, df2 = [pd.read_csv(f) for f in csv_files]
+        plt.figure(figsize=(10,5))
+        plt.plot(df1["run"], df1[column], marker="o", label=labels[0])
+        plt.plot(df2["run"], df2[column], marker="s", label=labels[1])
+        plt.xlabel("Execução (seed)")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.legend()
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_difference_barplot(csv_files, labels, column, ylabel, title, save_as):
+        df1, df2 = [pd.read_csv(f) for f in csv_files]
+        merged = pd.merge(df1, df2, on="run", suffixes=(f"_{labels[0]}", f"_{labels[1]}"))
+        merged["diff"] = merged[f"{column}_{labels[1]}"] - merged[f"{column}_{labels[0]}"]
+
+        plt.figure(figsize=(10,5))
+        plt.bar(merged["run"], merged["diff"], color=np.where(merged["diff"]>=0, "green", "red"))
+        plt.axhline(0, color="black", linestyle="--")
+        plt.xlabel("Execução (seed)")
+        plt.ylabel(f"Diferença de {ylabel} ({labels[1]} - {labels[0]})")
+        plt.title(title)
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_histograms(csv_files, labels, column, xlabel, title, save_as):
+        """
+        Plota histogramas sobrepostos (mesmos bins) para os arquivos CSV informados.
+        Mantém a assinatura que seu código chama: compare_histograms(csv_files, labels, column, ...)
+        """
+        # certifique-se de ter importado: import numpy as np, import pandas as pd, import matplotlib.pyplot as plt
+        dfs = [pd.read_csv(f) for f in csv_files]
+
+        # se a coluna não existir em algum CSV, avisa e retorna
+        for i, df in enumerate(dfs):
+            if column not in df.columns:
+                raise ValueError(f"Coluna '{column}' não encontrada no arquivo {csv_files[i]}")
+
+        # calcula bins comuns
+        col_min = min(df[column].min() for df in dfs)
+        col_max = max(df[column].max() for df in dfs)
+        if col_min == col_max:
+            # caso todos tenham o mesmo valor, cria uma pequena faixa para o hist
+            col_min -= 0.5
+            col_max += 0.5
+        bins = np.linspace(col_min, col_max, 12)  # 11 intervals (ajustável)
+
+        plt.figure(figsize=(8,5))
+        for df, label in zip(dfs, labels):
+            plt.hist(df[column], bins=bins, alpha=0.5, label=label, edgecolor='black')
+        plt.xlabel(xlabel)
+        plt.ylabel("Frequência")
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_histograms(csv_files, labels, column, xlabel, title, save_as):
+        dfs = [pd.read_csv(f) for f in csv_files]
+        plt.figure(figsize=(8,5))
+        for df, label in zip(dfs, labels):
+            plt.hist(df[column], bins=10, alpha=0.5, label=label)
+        plt.xlabel(xlabel)
+        plt.ylabel("Frequência")
+        plt.title(title)
+        plt.legend()
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_boxplot(csv_files, labels, column, ylabel, title, save_as):
+        dfs = [pd.read_csv(f) for f in csv_files]
+        data = [df[column] for df in dfs]
+        plt.figure(figsize=(8,5))
+        plt.boxplot(data, labels=labels)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_seed_scatter(csv_files, labels, save_as):
+        df1, df2 = [pd.read_csv(f) for f in csv_files]
+        merged = pd.merge(df1, df2, on="run", suffixes=(f"_{labels[0]}", f"_{labels[1]}"))
+
+        plt.figure(figsize=(6,6))
+        plt.scatter(merged[f"score_{labels[0]}"], merged[f"score_{labels[1]}"], alpha=0.7)
+        plt.plot([merged[f"score_{labels[0]}"].min(), merged[f"score_{labels[0]}"].max()],
+                 [merged[f"score_{labels[0]}"].min(), merged[f"score_{labels[0]}"].max()],
+                 color="red", linestyle="--", label="y=x")
+        plt.xlabel(f"Pontuação {labels[0]}")
+        plt.ylabel(f"Pontuação {labels[1]}")
+        plt.title("Comparação Pareada por Seed")
+        plt.legend()
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_deliveries_barplot(csv_files, labels, save_as):
+        dfs = [pd.read_csv(f) for f in csv_files]
+        means = [df["deliveries"].mean() for df in dfs]
+
+        plt.figure(figsize=(6,5))
+        plt.bar(labels, means, color=["skyblue", "orange"])
+        plt.ylabel("Entregas Médias")
+        plt.title("Número Médio de Entregas por Jogador")
+        plt.savefig(save_as)
+        plt.close()
+
+    @staticmethod
+    def compare_difference_histogram(csv_files, labels, column, ylabel, title, save_as):
+        df1, df2 = [pd.read_csv(f) for f in csv_files]
+        merged = pd.merge(df1, df2, on="run", suffixes=(f"_{labels[0]}", f"_{labels[1]}"))
+        merged["diff"] = merged[f"{column}_{labels[1]}"] - merged[f"{column}_{labels[0]}"]
+
+        plt.figure(figsize=(8,5))
+        plt.hist(merged["diff"], bins=10, alpha=0.7, color="purple")
+        plt.axvline(0, color="black", linestyle="--")
+        plt.xlabel(f"Diferença de {ylabel} ({labels[1]} - {labels[0]})")
+        plt.ylabel("Frequência")
+        plt.title(title)
+        plt.savefig(save_as)
+        plt.close()
+    
     @staticmethod
     def compare_histograms(csv_files, labels, column, xlabel, title, save_as):
         dfs = [pd.read_csv(f) for f in csv_files]
@@ -732,22 +761,70 @@ class Simulator:
         plt.savefig(save_as)
         plt.close()
 
+
+
 # ==========================
 # MAIN
 # ==========================
 if __name__ == "__main__":
     # Rodar simulações
-    sim_default = Simulator(DefaultPlayer, num_runs=24, seed=0)
+    sim_default = Simulator(DefaultPlayer, num_runs=40, seed=0)
     csv_default = "default_results.csv"
     sim_default.run(output_csv=csv_default)
 
-    sim_cluster = Simulator(ClusterSweepPlayer, num_runs=24, seed=0)
+    sim_cluster = Simulator(ClusterSweepPlayer, num_runs=40, seed=0)
     csv_cluster = "cluster_results.csv"
     sim_cluster.run(output_csv=csv_cluster)
 
     # Estatísticas descritivas
     Simulator.summary_stats(csv_default, "Default")
     Simulator.summary_stats(csv_cluster, "ClusterSweep")
+
+    # 🔹 Novos gráficos úteis
+    Simulator.compare_boxplot_with_points(
+        [csv_default, csv_cluster],
+        ["Default", "ClusterSweep"],
+        column="score",
+        ylabel="Pontuação",
+        title="Distribuição de Pontuação com Pontos Individuais",
+        save_as="comparison_boxplot_points.png"
+    )
+
+    Simulator.compare_violinplot(
+        [csv_default, csv_cluster],
+        ["Default", "ClusterSweep"],
+        column="score",
+        ylabel="Pontuação",
+        title="Distribuição de Pontuação (Violin Plot)",
+        save_as="comparison_violinplot.png"
+    )
+
+    Simulator.compare_line_per_seed(
+        [csv_default, csv_cluster],
+        ["Default", "ClusterSweep"],
+        column="score",
+        ylabel="Pontuação",
+        title="Pontuação por Execução (Seed)",
+        save_as="comparison_line_per_seed.png"
+    )
+
+    Simulator.compare_difference_barplot(
+        [csv_default, csv_cluster],
+        ["Default", "ClusterSweep"],
+        column="score",
+        ylabel="Pontuação",
+        title="Diferença de Pontuação por Execução",
+        save_as="comparison_difference_barplot.png"
+    )
+
+    Simulator.compare_difference_histogram(
+        [csv_default, csv_cluster],
+        ["Default", "ClusterSweep"],
+        column="score",
+        ylabel="Pontuação",
+        title="Histograma das Diferenças de Pontuação",
+        save_as="comparison_difference_histogram.png"
+    )
 
     # Comparações gráficas
     Simulator.compare_histograms(
@@ -791,6 +868,7 @@ if __name__ == "__main__":
         ["Default", "ClusterSweep"],
         save_as="comparison_score_vs_steps.png"
     )
+
 
 
     # parser = argparse.ArgumentParser(
